@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>ESP32 Potentiometer MiniGame (BLE+NUS)</title>
+<style>
+  html,body{margin:0;height:100%;background:black;color:white;overflow:hidden;}
+  .stage{position:relative;width:100vw;height:100vh;}
+
+  /* 비디오 겹쳐두고 show 토글 */
+  .videoLayer{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    object-fit:cover;
+    background:black;
+    display:none;
+  }
+  .videoLayer.show{display:block;}
+
+  #pairBtn{
+    position:fixed; top:10px; left:50%; transform:translateX(-50%);
+    padding:10px 18px; font-size:16px; z-index:9999;
+  }
+  #gameUI{
+    position:fixed; left:50%; bottom:50px; transform:translateX(-50%);
+    width:80%; height:30px; background:#333; border-radius:15px;
+    overflow:hidden; display:none; z-index:9999;
+  }
+  #gauge{height:100%; width:0%; background:lime;}
+  #target{position:absolute; top:0; width:4px; height:100%; background:red;}
+  #status{
+    position:fixed; left:50%; bottom:100px; transform:translateX(-50%);
+    font-size:24px; display:none; z-index:9999;
+  }
+  #tapHint{
+    position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+    font-size:22px; color:#fff; z-index:9999; padding:12px 18px;
+    background:rgba(0,0,0,0.4); border-radius:10px;
+  }
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <button id="pairBtn">BLE 연결/재연결</button>
+
+  <div id="gameUI"><div id="gauge"></div><div id="target"></div></div>
+  <div id="status"></div>
+  <div id="tapHint">화면을 터치하면 시작합니다</div>
+
+  <!-- 비디오 5개 겹쳐서 show/hide -->
+  <video id="vA" class="videoLayer show" src="videoA.mp4" muted loop playsinline preload="auto"></video>
+  <video id="vB" class="videoLayer"        src="videoB.mp4" muted      playsinline preload="auto"></video>
+  <video id="vC" class="videoLayer"        src="videoC.mp4" muted      playsinline preload="auto"></video>
+  <video id="vD" class="videoLayer"        src="videoD.mp4" muted      playsinline preload="auto"></video>
+  <video id="vE" class="videoLayer"        src="videoE.mp4" muted      playsinline preload="auto"></video>
+</div>
+
+<script>
+/* ===== NUS UUID ===== */
+const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const NUS_TX_CHAR = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // Notify
+
+/* ===== 상태 변수 ===== */
+let device, server, service, txChar;
+let potValue=0, targetValue=0, gameActive=false, gameTimer=null, current='A';
+let rxBuffer = "";
+
+/* ===== 엘리먼트 ===== */
+const pairBtn = document.getElementById('pairBtn');
+const gameUI  = document.getElementById('gameUI');
+const gauge   = document.getElementById('gauge');
+const target  = document.getElementById('target');
+const statusBox = document.getElementById('status');
+const tapHint = document.getElementById('tapHint');
+
+const videos = {
+  A: document.getElementById('vA'),
+  B: document.getElementById('vB'),
+  C: document.getElementById('vC'),
+  D: document.getElementById('vD'),
+  E: document.getElementById('vE'),
+};
+
+/* ===== 비디오 전환 ===== */
+function showVideo(key,{loop=false,fromStart=true}={}){
+  Object.entries(videos).forEach(([k,v])=>{
+    v.classList.toggle('show', k===key);
+    if(k!==key) v.pause();
+  });
+  const v = videos[key];
+  v.loop = loop;
+  if(fromStart){ try{ v.currentTime=0; }catch(_){} }
+  v.play().catch(()=>{});
+  current = key;
+}
+function showGaugeVis(b){ gameUI.style.display = b?'block':'none'; }
+
+/* ===== BLE 연결 ===== */
+async function connectBLE(){
+  try{
+    if(device && device.gatt.connected){ device.gatt.disconnect(); }
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_SERVICE] }],
+      optionalServices: [NUS_SERVICE]
+    });
+
+    server  = await device.gatt.connect();
+    service = await server.getPrimaryService(NUS_SERVICE);
+    txChar  = await service.getCharacteristic(NUS_TX_CHAR);
+
+    await txChar.startNotifications();
+    txChar.addEventListener('characteristicvaluechanged', onNusData);
+
+    console.log("✅ BLE connected");
+  }catch(e){
+    console.error("❌ BLE error", e);
+    alert("BLE 오류: "+e);
+  }
+}
+
+/* ===== BLE 데이터 수신 ===== */
+function onNusData(e){
+  const chunk = new TextDecoder().decode(e.target.value);
+  rxBuffer += chunk;
+
+  let idx;
+  while((idx = rxBuffer.indexOf("\n")) >= 0){
+    const line = rxBuffer.slice(0, idx).trim();
+    rxBuffer = rxBuffer.slice(idx+1);
+    const v = parseInt(line,10);
+    if(!Number.isNaN(v)){
+      potValue = Math.max(0, Math.min(4095, v));
+      if(gameActive && current==='C'){
+        gauge.style.width = (potValue/4095*100)+"%";
+      }
+    }
+  }
+}
+
+/* ===== 게임 흐름 ===== */
+function startFlow(){
+  tapHint.style.display = 'none';
+  statusBox.style.display = 'none';
+  showGaugeVis(false);
+  showVideo('B',{loop:false});
+}
+
+function startMiniGameOnC(){
+  gameActive = true;
+  showGaugeVis(true);
+  statusBox.style.display = 'none';
+
+  targetValue = Math.floor(Math.random()*4095);
+  target.style.left = (targetValue/4095*100)+"%";
+
+  clearTimeout(gameTimer);
+  gameTimer = setTimeout(()=>{ if(current==='C') endGame(); },3000);
+}
+
+function endGame(){
+  gameActive = false;
+  showGaugeVis(false);
+  const diff = Math.abs(potValue-targetValue);
+  if(diff<100){
+    statusBox.textContent="🎉 성공!";
+    showVideo('D',{loop:false});
+  }else{
+    statusBox.textContent="❌ 실패!";
+    showVideo('E',{loop:false});
+  }
+  statusBox.style.display='block';
+}
+
+function resetToA(){
+  statusBox.style.display='none';
+  showGaugeVis(false);
+  tapHint.style.display='block';
+  showVideo('A',{loop:true});
+}
+
+/* ===== 이벤트 ===== */
+videos.B.addEventListener('ended',()=>{showVideo('C'); startMiniGameOnC();});
+videos.C.addEventListener('ended',()=>{ if(gameActive) endGame(); });
+videos.D.addEventListener('ended',resetToA);
+videos.E.addEventListener('ended',resetToA);
+
+Object.values(videos).forEach(v=> v.addEventListener('click',startFlow));
+pairBtn.addEventListener('click', connectBLE);
+
+/* 초기 A 실행 */
+Object.values(videos).forEach(v=>{try{v.load();}catch(_){}}); 
+showVideo('A',{loop:true});
+</script>
+</body>
+</html>
